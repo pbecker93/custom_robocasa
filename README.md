@@ -1,5 +1,8 @@
 # custom_robocasa
 
+This repository contains the custom components for the Robocasa benchmark. The custom components
+provide point cloud wrappers which can be used to generate point clouds from the Robocasa dataset and simulation.
+
 ### Installation
 
 ```
