@@ -1,7 +1,7 @@
 import gym
 
-from custom_robocasa.utils.point_cloud.sampling.base_pc_sampler import BasePointCloudSampler
-from custom_robocasa.utils.point_cloud.sampling.uniform_pc_sampler import UniformPointCloudSampler
+from robocasa.utils.point_cloud.sampling.base_pc_sampler import BasePointCloudSampler
+from robocasa.utils.point_cloud.sampling.uniform_pc_sampler import UniformPointCloudSampler
 
 
 class PointCloudSamplingWrapper(gym.Wrapper):

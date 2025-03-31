@@ -1,10 +1,10 @@
-from custom_robocasa.utils.point_cloud.sampling.base_pc_sampler import (
+from robocasa.utils.point_cloud.sampling.base_pc_sampler import (
     BasePointCloudSampler,
 )
 import gym
 import numpy as np
 
-from custom_robocasa.utils.point_cloud.sampling.uniform_pc_sampler import UniformPointCloudSampler
+from robocasa.utils.point_cloud.sampling.uniform_pc_sampler import UniformPointCloudSampler
 
 ENV_OBJ_NAMES = {
     "PnPCounterToCab": "obj",

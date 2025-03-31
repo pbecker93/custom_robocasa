@@ -2,7 +2,7 @@
 Script to extract observations from low-dimensional simulation states in a robocasa dataset.
 Adapted from robomimic's dataset_states_to_obs.py script.
 """
-
+import gc
 import os
 import json
 from typing import OrderedDict
@@ -14,9 +14,8 @@ import multiprocessing
 import queue
 import time
 import traceback
-from persistqueue import Queue as PersistQueue
-from persistqueue import SQLiteQueue as SQLitePersistQueue
 
+from robocasa.env_wrappers.camera_info_wrapper import CameraInfoWrapper
 from robocasa.utils.env_utils import create_env
 import robocasa.utils.robomimic.robomimic_tensor_utils as TensorUtils
 import robocasa.utils.robomimic.robomimic_dataset_utils as DatasetUtils
@@ -95,7 +94,7 @@ def extract_trajectory(
 
     max_segmented_pc_size = 0
 
-    traj_len = 20 #states.shape[0]
+    traj_len = states.shape[0]
     # iteration variable @t is over "next obs" indices
     for t in tqdm(range(traj_len)):
         obs = deepcopy(env.reset_to({"states": states[t]}))
@@ -143,7 +142,6 @@ def extract_trajectory(
         traj["rewards"].append(r)
         traj["dones"].append(done)
         traj["datagen_info"].append(datagen_info)
-        # traj["actions_abs"].append(action_abs)
 
     # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
     traj["obs"] = TensorUtils.list_of_flat_dict_to_dict_of_list(traj["obs"])
@@ -174,223 +172,114 @@ def extract_trajectory(
 """ The process that writes over the generated files to memory """
 
 
-def write_traj_to_file(
-    args, output_path, total_samples, mul_queue
-):
+def write_traj_to_file(args, output_path, item):
     f = h5py.File(args.dataset, "r")
     f_out = h5py.File(output_path, "w")
-    data_grp = f_out.create_group("data")
     start_time = time.time()
-    num_processed = 0
 
-    try:
-        while num_processed < total_samples:
-            item = mul_queue.get()
-            num_processed = num_processed + 1
-            ep = item[0]
-            traj = item[1]
-            process_num = item[2]
-            try:
-                ep_data_grp = data_grp.create_group(ep)
-                ep_data_grp.create_dataset(
-                    "actions", data=np.array(traj["actions"])
-                )
-                if args.global_actions:
-                    ep_data_grp.create_dataset(
-                        "global_actions", data=np.array(traj["global_actions"])
-                    )
-                ep_data_grp.create_dataset("states", data=np.array(traj["states"]))
-                ep_data_grp.create_dataset(
-                    "rewards", data=np.array(traj["rewards"])
-                )
-                ep_data_grp.create_dataset("dones", data=np.array(traj["dones"]))
-                # ep_data_grp.create_dataset(
-                #     "actions_abs", data=np.array(traj["actions_abs"])
-                # )
-                for k in traj["obs"]:
-                    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-                    print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total before writing {k} at process {process_num}", flush=True)
-                    if isinstance(traj["obs"][k], OrderedDict):
-                        for kp in traj["obs"][k]:
-                            if args.no_compress:
-                                ep_data_grp.create_dataset(
-                                    "obs/{}/{}".format(k, kp),
-                                    data=np.array(traj["obs"][k][kp]),
-                                )
-                            else:
-                                ep_data_grp.create_dataset(
-                                    "obs/{}/{}".format(k, kp),
-                                    data=np.array(traj["obs"][k][kp]),
-                                    compression="gzip",
-                                    chunks=True,
-                                )
-                        continue
-                    if args.no_compress:
-                        ep_data_grp.create_dataset(
-                            "obs/{}".format(k), data=np.array(traj["obs"][k])
-                        )
-                    else:
-                        ep_data_grp.create_dataset(
-                            "obs/{}".format(k),
-                            data=np.array(traj["obs"][k]),
-                            compression="gzip",
-                            chunks=True,
-                        )
-                    if args.include_next_obs:
-                        if args.no_compress:
-                            ep_data_grp.create_dataset(
-                                "next_obs/{}".format(k),
-                                data=np.array(traj["next_obs"][k]),
-                            )
-                        else:
-                            ep_data_grp.create_dataset(
-                                "next_obs/{}".format(k),
-                                data=np.array(traj["next_obs"][k]),
-                                compression="gzip",
-                            )
+    ep = item[0]
+    traj = item[1]
+    process_num = item[2]
 
-                if "datagen_info" in traj:
-                    for k in traj["datagen_info"]:
-                        ep_data_grp.create_dataset(
-                            "datagen_info/{}".format(k),
-                            data=np.array(traj["datagen_info"][k]),
-                        )
+    f_out.create_dataset("actions", data=np.array(traj["actions"]))
+    if args.global_actions:
+        f_out.create_dataset("global_actions", data=np.array(traj["global_actions"]))
+    f_out.create_dataset("states", data=np.array(traj["states"]))
+    f_out.create_dataset("rewards", data=np.array(traj["rewards"]))
+    f_out.create_dataset("dones", data=np.array(traj["dones"]))
 
-                # copy action dict (if applicable)
-                if "data/{}/action_dict".format(ep) in f:
-                    action_dict = f["data/{}/action_dict".format(ep)]
-                    for k in action_dict:
-                        ep_data_grp.create_dataset(
-                            "action_dict/{}".format(k),
-                            data=np.array(action_dict[k][()]),
-                        )
+    for k in traj["obs"]:
+        total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+        total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+        print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing {k}", flush=True)
 
-                # episode metadata
-                ep_data_grp.attrs["model_file"] = traj["initial_state_dict"][
-                    "model"
-                ]  # model xml for this episode
-                ep_data_grp.attrs["ep_meta"] = traj["initial_state_dict"][
-                    "ep_meta"
-                ]  # ep meta data for this episode
-                # if "ep_meta" in f["data/{}".format(ep)].attrs:
-                #     ep_data_grp.attrs["ep_meta"] = f["data/{}".format(ep)].attrs["ep_meta"]
-                ep_data_grp.attrs["num_samples"] = traj["actions"].shape[
-                    0
-                ]  # number of transitions in this episode
+        if isinstance(traj["obs"][k], OrderedDict):
+            for kp in traj["obs"][k]:
+                data = np.array(traj["obs"][k][kp])
+                if args.no_compress:
+                    f_out.create_dataset(f"obs/{k}/{kp}", data=data)
+                else:
+                    f_out.create_dataset(f"obs/{k}/{kp}", data=data, compression="gzip", chunks=True)
+                del data
+                gc.collect()
+            continue
 
-                total_samples += traj["actions"].shape[0]
-            except Exception as e:
-                print("++" * 50)
-                print(
-                    f"Error at Process {process_num} on episode {ep} with \n\n {e}"
-                )
-                print("++" * 50)
-                raise Exception("Write out to file has failed")
-            print(f"ep {num_processed}: wrote {ep_data_grp.attrs['num_samples']} transitions to group {ep} at process {process_num} with {num_processed} finished. Datagen rate: {(time.time() - start_time) / num_processed} sec/demo")
-    except KeyboardInterrupt:
-        print("Control C pressed. Closing File and ending \n\n\n\n\n\n\n")
+        data = np.array(traj["obs"][k])
+        if args.no_compress:
+            f_out.create_dataset(f"obs/{k}", data=data)
+        else:
+            f_out.create_dataset(f"obs/{k}", data=data, compression="gzip", chunks=True)
+        del data
+        gc.collect()
 
-    if "mask" in f:
-        f.copy("mask", f_out)
+        if args.include_next_obs:
+            data = np.array(traj["next_obs"][k])
+            if args.no_compress:
+                f_out.create_dataset(f"next_obs/{k}", data=data)
+            else:
+                f_out.create_dataset(f"next_obs/{k}", data=data, compression="gzip")
+            del data
+            gc.collect()
 
-    # global metadata
-    data_grp.attrs["total"] = total_samples
-    env_meta = DatasetUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
-    if args.generative_textures:
-        env_meta["env_kwargs"]["generative_textures"] = "100p"
-    if args.randomize_cameras:
-        env_meta["env_kwargs"]["randomize_cameras"] = True
-    print("total processes end {}".format(num_processed))
-    # data_grp.attrs["env_args"] = json.dumps(
-    #     env.serialize(), indent=4
-    # )  # environment info
-    print("Wrote {} total samples to {}".format(total_samples, output_path))
+    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing datagen_info", flush=True)
+    if "datagen_info" in traj:
+        for k in traj["datagen_info"]:
+            data = np.array(traj["datagen_info"][k])
+            f_out.create_dataset(f"datagen_info/{k}", data=data)
+            del data
+            gc.collect()
 
+    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing action_dict", flush=True)
+    if "data/{}/action_dict".format(ep) in f:
+        action_dict = f["data/{}/action_dict".format(ep)]
+        for k in action_dict:
+            data = np.array(action_dict[k][()])
+            f_out.create_dataset(f"action_dict/{k}", data=data)
+            del data
+            gc.collect()
+
+    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing initial_state_dict/model", flush=True)
+    f_out.attrs["model_file"] = str(traj["initial_state_dict"]["model"])
+    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing initial_state_dict/ep_meta", flush=True)
+    f_out.attrs["ep_meta"] = str(traj["initial_state_dict"]["ep_meta"])
+    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing num_samples", flush=True)
+    f_out.attrs["num_samples"] = traj["actions"].shape[0]
+
+    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
+    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before closing", flush=True)
     f_out.close()
     f.close()
 
     DatasetUtils.extract_action_dict(dataset=output_path)
-    # DatasetUtils.make_demo_ids_contiguous(dataset=output_path)
-    for num_demos in [
-        10,
-        20,
-        30,
-        40,
-        50,
-        60,
-        70,
-        75,
-        80,
-        90,
-        100,
-        125,
-        150,
-        200,
-        250,
-        300,
-        400,
-        500,
-        600,
-        700,
-        800,
-        900,
-        1000,
-        1500,
-        2000,
-        2500,
-        3000,
-        4000,
-        5000,
-        10000,
-    ]:
-        DatasetUtils.filter_dataset_size(
-            output_path,
-            num_demos=num_demos,
-        )
-
     print("Writing has finished")
 
     end_time = time.time()
-
-    # Calculate the elapsed time
     elapsed_time = end_time - start_time
-
     print(f"Time elapsed: {elapsed_time:.2f} seconds")
     return
 
 
-# runs multiple trajectory. If there has been an unrecoverable error, the system puts the current work back into the queue and exits
-def extract_multiple_trajectories(
-    process_num, current_work_array, work_queue, lock, args2, mul_queue
-):
+def retrieve_new_index(work_queue):
     try:
-        extract_multiple_trajectories_with_error(
-            process_num, current_work_array, work_queue, lock, args2, mul_queue
-        )
-    except Exception as e:
-        work_queue.put(current_work_array[process_num])
-        print("*>*" * 50)
-        print("Error process num {}:".format(process_num))
-        print(e)
-        print(traceback.format_exc())
-        print("*>*" * 50)
-        print()
+        tmp = work_queue.get(False)
+        return tmp
+    except queue.Empty:
+        return -1
 
 
-def retrieve_new_index(process_num, current_work_array, work_queue, lock):
-    with lock:
-        if work_queue.empty():
-            return -1
-        try:
-            tmp = work_queue.get(False)
-            current_work_array[process_num] = tmp
-            return tmp
-        except queue.Empty:
-            return -1
-
-
-def extract_multiple_trajectories_with_error(
-    process_num, current_work_array, work_queue, lock, args, mul_queue
+def extract_multiple_trajectories(
+    process_num, args, work_queue, output_folder=None
 ):
     # create environment to use for data processing
 
@@ -429,69 +318,61 @@ def extract_multiple_trajectories_with_error(
     if args.n is not None:
         demos = demos[: args.n]
 
-    ind = retrieve_new_index(process_num, current_work_array, work_queue, lock)
+    ind = retrieve_new_index(work_queue)
     while (not work_queue.empty()) and (ind != -1):
-        try:
-            # print("Running {} index".format(ind))
-            ep = demos[ind]
+        # print("Running {} index".format(ind))
+        ep = demos[ind]
 
-            # prepare initial state to reload from
-            states = f["data/{}/states".format(ep)][()]
-            initial_state = dict(states=states[0])
-            initial_state["model"] = f["data/{}".format(ep)].attrs["model_file"]
-            initial_state["ep_meta"] = f["data/{}".format(ep)].attrs.get(
-                "ep_meta", None
-            )
+        # prepare initial state to reload from
+        states = f["data/{}/states".format(ep)][()]
+        initial_state = dict(states=states[0])
+        initial_state["model"] = f["data/{}".format(ep)].attrs["model_file"]
+        initial_state["ep_meta"] = f["data/{}".format(ep)].attrs.get(
+            "ep_meta", None
+        )
 
-            # extract obs, rewards, dones
-            actions = f["data/{}/actions".format(ep)][()]
+        # extract obs, rewards, dones
+        actions = f["data/{}/actions".format(ep)][()]
 
-            traj = extract_trajectory(
-                env=env,
-                initial_state=initial_state,
-                states=states,
-                actions=actions,
-                done_mode=args.done_mode,
-                add_datagen_info=args.add_datagen_info,
-                args=args,
-            )
+        traj = extract_trajectory(
+            env=env,
+            initial_state=initial_state,
+            states=states,
+            actions=actions,
+            done_mode=args.done_mode,
+            add_datagen_info=args.add_datagen_info,
+            args=args,
+        )
 
-            # maybe copy reward or done signal from source file
-            if args.copy_rewards:
-                traj["rewards"] = f["data/{}/rewards".format(ep)][()]
-            if args.copy_dones:
-                traj["dones"] = f["data/{}/dones".format(ep)][()]
+        # maybe copy reward or done signal from source file
+        if args.copy_rewards:
+            traj["rewards"] = f["data/{}/rewards".format(ep)][()]
+        if args.copy_dones:
+            traj["dones"] = f["data/{}/dones".format(ep)][()]
 
-            ep_grp = f["data/{}".format(ep)]
+        ep_grp = f["data/{}".format(ep)]
 
-            states = ep_grp["states"][()]
-            initial_state = dict(states=states[0])
-            initial_state["model"] = ep_grp.attrs["model_file"]
-            initial_state["ep_meta"] = ep_grp.attrs.get("ep_meta", None)
+        states = ep_grp["states"][()]
+        initial_state = dict(states=states[0])
+        initial_state["model"] = ep_grp.attrs["model_file"]
+        initial_state["ep_meta"] = ep_grp.attrs.get("ep_meta", None)
 
-            # store transitions
+        # store transitions
 
-            # IMPORTANT: keep name of group the same as source file, to make sure that filter keys are
-            #            consistent as well
-            # print("(process {}): ADD TO QUEUE index {}".format(process_num, ind))
-            total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-            print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total before putting {ep} at process {process_num}", flush=True)
+        # IMPORTANT: keep name of group the same as source file, to make sure that filter keys are
+        #            consistent as well
+        # print("(process {}): ADD TO QUEUE index {}".format(process_num, ind))
+        total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+        print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total before putting {ep} at process {process_num}", flush=True)
 
-            mul_queue.put([ep, traj, process_num])
+        # mul_queue.put([ep, traj, process_num])
+        out_file = os.path.join(output_folder, f"processed_{ep}.hdf5")
+        write_traj_to_file(args, out_file, [ep, traj, process_num])
 
-            total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-            print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total after putting {ep} at process {process_num}", flush=True)
+        total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
+        print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total after putting {ep} at process {process_num}", flush=True)
 
-
-            ind = retrieve_new_index(process_num, current_work_array, work_queue, lock)
-        except Exception as e:
-            print("_" * 50)
-            print("Process {}:".format(process_num))
-            print("Error processing demo index {}: {}".format(ind, e))
-            print(traceback.format_exc())
-            print("_" * 50)
-            del env
-            env = create_env_with_wrappers(env_meta["env_name"], args)
+        ind = retrieve_new_index(work_queue)
 
     f.close()
     print("Process {} finished".format(process_num))
@@ -506,7 +387,7 @@ def create_env_with_wrappers(env_name, args):
     )
 
     if args.segmentation:
-        env = SegmentationWrapper(RobosuiteWrapper(base_env), env_name=env_name)
+        env = CameraInfoWrapper(SegmentationWrapper(RobosuiteWrapper(base_env), env_name=env_name))
     else:
         env = RobosuiteWrapper(base_env)
 
@@ -561,33 +442,23 @@ def dataset_states_to_obs_multiprocessing(args):
     env_meta = DatasetUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
     num_processes = args.num_procs
 
-    lock = multiprocessing.Lock()
-
-    persist_queue_dir = os.path.join(os.path.dirname(args.dataset), "persist_queue")
-    if not os.path.exists(persist_queue_dir):
-        os.makedirs(persist_queue_dir)
-    mul_queue = PersistQueue(persist_queue_dir, autosave=True)
-
     work_queue = multiprocessing.Queue()
     for index in range(num_demos):
         work_queue.put(index)
-    current_work_array = multiprocessing.Array("i", num_processes)
-    processes = []
-    # for i in range(num_processes):
-    #     process = multiprocessing.Process(
-    #         target=extract_multiple_trajectories,
-    #         args=(
-    #             i,
-    #             current_work_array,
-    #             work_queue,
-    #             lock,
-    #             args,
-    #             mul_queue,
-    #         ),
-    #     )
-    #     processes.append(process)
 
-    extract_multiple_trajectories(0, current_work_array, work_queue, lock, args, mul_queue)
+    processes = []
+    for i in range(num_processes):
+        process = multiprocessing.Process(
+            target=extract_multiple_trajectories,
+            args=(
+                i,
+                args,
+                work_queue,
+            ),
+        )
+        processes.append(process)
+
+    # extract_multiple_trajectories(0, args, work_queue, output_folder=os.path.dirname(args.dataset))
 
     # process1 = multiprocessing.Process(
     #     target=write_traj_to_file,

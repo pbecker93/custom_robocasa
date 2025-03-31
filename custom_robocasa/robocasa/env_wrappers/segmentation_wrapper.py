@@ -131,12 +131,13 @@ class SegmentationWrapper(gym.Wrapper):
             segmentation = get_camera_segmentation(self.env.sim, cam, img_height, img_width)[:, :, 1]
             
             for class_name, geom_ids in class_to_geom_ids.items():
-                masks[cam][class_name] = np.zeros(segmentation.shape, dtype=bool)
-                for geom_id in geom_ids:
-                    masks[cam][class_name][segmentation == geom_id] = True
-                    
-                masks[cam][class_name] = masks[cam][class_name].squeeze()
-                    
+                geom_ids_arr = np.array(geom_ids)
+                # Broadcasting comparison over the last axis, then taking any() along that axis.
+                # masks[cam][class_name] = (segmentation[..., None] == geom_ids_arr).any(axis=-1)
+
+                masks[cam][class_name] = np.isin(segmentation, geom_ids)
+                # masks[cam][class_name] = masks[cam][class_name].squeeze()
+
         return masks
 
     def get_class_to_geom_ids(self):

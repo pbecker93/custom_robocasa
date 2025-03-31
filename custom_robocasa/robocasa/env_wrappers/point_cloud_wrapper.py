@@ -1,5 +1,5 @@
 import gym
-from custom_robocasa.utils.point_cloud.pc_generator import PointCloudGenerator
+from robocasa.utils.point_cloud.pc_generator import PointCloudGenerator
 
 class PointCloudWrapper(gym.Wrapper):
     def __init__(self, env, global_frame: bool, get_segmented_pc: bool = False, get_normal_pc: bool = True):

@@ -1,4 +1,4 @@
-from custom_robocasa.utils.point_cloud.sampling.base_pc_sampler import BasePointCloudSampler
+from robocasa.utils.point_cloud.sampling.base_pc_sampler import BasePointCloudSampler
 import numpy as np
 
 
