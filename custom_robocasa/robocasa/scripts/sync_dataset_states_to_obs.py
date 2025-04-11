@@ -32,14 +32,123 @@ from robocasa.utils.transform_utils import (
 
 # from robomimic.utils.log_utils import log_warning
 
+def get_leaf_memory_usage(d, path=()):
+    """
+    Recursively traverse a nested dictionary and yield (path, memory in bytes)
+    for each leaf that is a list of NumPy arrays.
+    """
+    if isinstance(d, dict):
+        for k, v in d.items():
+            yield from get_leaf_memory_usage(v, path + (k,))
+    elif isinstance(d, list) and all(isinstance(arr, np.ndarray) for arr in d):
+        total_bytes = sum(arr.nbytes for arr in d)
+        yield (path, total_bytes)
+    elif isinstance(d, list) and all(isinstance(arr, dict) for arr in d):
+        for i, arr in enumerate(d):
+            yield from get_leaf_memory_usage(arr, path + (i,))
+    elif isinstance(d, np.ndarray):
+        total_bytes = d.nbytes
+        yield (path, total_bytes)
+
+
+def find_largest_leaf(d, top_n=5):
+    """
+    Finds the paths to the top N largest leaves and prints their memory allocation.
+    """
+    memory_usages = list(get_leaf_memory_usage(d))
+    memory_usages.sort(key=lambda x: x[1], reverse=True)
+
+    print(f"Top {top_n} largest leaves by memory usage:\n")
+    for path, mem in memory_usages[:top_n]:
+        print(f"Path: {' -> '.join(map(str, path))} | Memory: {mem / (1024 ** 2):.2f} MB")
+
+def prepare_hdf5_file(args, output_path, init_sample, total_length = 0, use_in_memory=False):
+    """
+    Prepares the HDF5 file for writing by creating the necessary groups and datasets.
+    """
+    if use_in_memory:
+        f_out = h5py.File.in_memory()
+    else:
+        f_out = h5py.File(output_path, "w")
+    f_out.create_group("obs")
+    f_out.create_group("action_dict")
+
+    compression = "gzip" if not args.no_compress else None
+
+    f_out.create_dataset("rewards", (total_length,), maxshape=(total_length,), chunks=True, compression=compression)
+    f_out.create_dataset("dones", (total_length,), maxshape=(total_length,), chunks=True, compression=compression)
+
+    f_out.create_dataset("actions", (total_length,*init_sample["actions"].shape), maxshape=(total_length,*init_sample["actions"].shape), chunks=True, compression=compression)
+    f_out.create_dataset("states", maxshape=(total_length,*init_sample["states"].shape), chunks=True, shape=(total_length, *init_sample["states"].shape), compression=compression)
+
+
+    for k, v in init_sample["obs"].items():
+        if isinstance(v, np.ndarray):
+            f_out.create_dataset(f"obs/{k}", maxshape=(total_length, *v.shape), chunks=(1, *v.shape), compression=compression, shape=(total_length, *v.shape))
+        elif isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                dtype = sub_v.dtype
+                f_out.create_dataset(f"obs/{k}/{sub_k}", maxshape=(total_length, *sub_v.shape), chunks=(1, *sub_v.shape), compression=compression, shape=(total_length, *sub_v.shape), dtype=dtype)
+
+    return f_out
+
+def append_to_hdf5_file(f_out, data, index):
+    """
+    Appends data to the HDF5 file.
+    """
+    # Rewards
+    f_out["rewards"][index] = data["rewards"]
+    f_out["dones"][index] = data["dones"]
+    f_out["states"][index] = data["states"]
+    # Actions
+    f_out["actions"][index] = data["actions"]
+
+    # Observations
+    f_obs = f_out["obs"]
+    for k, v in data["obs"].items():
+        if isinstance(v, np.ndarray):
+            if k not in f_obs:
+                raise ValueError(f"Key {k} not found in f_obs")
+            else:
+                f_obs[k][index] = v
+        elif isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                if sub_k not in f_obs[k]:
+                    raise ValueError(f"Key {v}/{sub_k} not found in f_obs")
+                else:
+                    f_obs[f"{k}/{sub_k}"][index] = sub_v
+
+def finish_hdf5_file(f_out, traj, output_path, action_dict):
+    """
+    Finalizes the HDF5 file by closing it.
+    """
+    for k in action_dict:
+        data = np.array(action_dict[k][()])
+        f_out.create_dataset(f"action_dict/{k}", data=data)
+        del data
+        gc.collect()
+
+    f_out.attrs["model_file"] = str(traj["initial_state_dict"]["model"])
+    f_out.attrs["ep_meta"] = str(traj["initial_state_dict"]["ep_meta"])
+    f_out.attrs["num_samples"] = traj["actions"].shape[0]
+
+    f_out.close()
+
+    DatasetUtils.sync_extract_action_dict(dataset=output_path)
+    print(f"Writing has finished ${output_path}")
+
+    f_out.close()
 
 def extract_trajectory(
     env,
     initial_state,
     states,
     actions,
+    action_dict,
     done_mode,
     args,
+    output_path,
+    ep,
     add_datagen_info=False,
 ):
     """
@@ -59,6 +168,18 @@ def extract_trajectory(
 
     # load the initial state
     env.reset()
+    initial_state["model"] = initial_state["model"].replace(
+        '<site name="gripper0_right_grip_site_cylinder" pos="0 0 0" size="0.005 10" group="1" type="cylinder" rgba="0 1 0 0.3"/>',
+        '<site name="gripper0_right_grip_site_cylinder" pos="0 0 0" size="0.005 0.001" group="1" type="cylinder" rgba="0 1 0 0.3"/>')
+    initial_state["model"] = initial_state["model"].replace(
+        '<site name="gripper0_right_ee_z" pos="0 0 0.1" size="0.005 0.1" group="1" type="cylinder" rgba="0 0 1 0"/>',
+        '<site name="gripper0_right_ee_z" pos="0 0 0.1" size="0.005 0.001" group="1" type="cylinder" rgba="0 0 1 0"/>')
+    initial_state["model"] = initial_state["model"].replace(
+        '<site name="gripper0_right_ee_y" pos="0 0.1 0" quat="0.707105 0.707108 0 0" size="0.005 0.1" group="1" type="cylinder" rgba="0 1 0 0"/>',
+        '<site name="gripper0_right_ee_y" pos="0 0.1 0" quat="0.707105 0.707108 0 0" size="0.005 0.001" group="1" type="cylinder" rgba="0 1 0 0"/>')
+    initial_state["model"] = initial_state["model"].replace(
+        '<site name="gripper0_right_ee_x" pos="0.1 0 0" quat="0.707105 0 0.707108 0" size="0.005 0.1" group="1" type="cylinder" rgba="1 0 0 0"/>',
+        '<site name="gripper0_right_ee_x" pos="0.1 0 0" quat="0.707105 0 0.707108 0" size="0.005 0.001" group="1" type="cylinder" rgba="1 0 0 0"/>')
     env.reset_to(initial_state)
 
     # get updated ep meta in case it's been modified
@@ -83,7 +204,7 @@ def extract_trajectory(
         next_obs=[],
         rewards=[],
         dones=[],
-        actions=np.array(actions),
+        actions=np.array(actions),\
         # actions_abs=[],
         states=np.array(states),
         initial_state_dict=initial_state,
@@ -92,7 +213,8 @@ def extract_trajectory(
     if args.global_actions:
         traj["global_actions"] = np.array(global_actions)
 
-    max_segmented_pc_size = 0
+    # hdf5 file to write to
+    hdf5_file = None
 
     traj_len = states.shape[0]
     # iteration variable @t is over "next obs" indices
@@ -103,7 +225,7 @@ def extract_trajectory(
         for obs_key in obs:
             if args.dont_store_image and "image" in obs_key:
                 obs_keys_to_remove.append(obs_key)
-            
+
             if args.dont_store_depth and "depth" in obs_key:
                 obs_keys_to_remove.append(obs_key)
 
@@ -135,140 +257,48 @@ def extract_trajectory(
         done = int(done)
 
         # get the absolute action
-        # action_abs = env.base_env.convert_rel_to_abs_action(actions[t])
+        local_action = np.zeros_like(actions[t])
+        action_abs = env.convert_rel_to_abs_action(local_action).copy() #actions[t])
+        action_abs2 = env.convert_rel_to_abs_action(actions[t]).copy()
+        rel_action = env.convert_abs_to_rel_action(action_abs2)
+        rel_action2 = actions[t]
+        #
+        # print("action_abs", action_abs)
+        # print("action_abs2", action_abs2)
+        # print("rel_action", rel_action)
+        # print("rel_action2", rel_action2)
+        # print("diff", action_abs - action_abs2)
+
+        print("action_abs", action_dict["abs_pos"][t])
+        print("robot0_base_to_eef_pos", obs["robot0_base_to_eef_pos"])
+        print("diff", action_dict["abs_pos"][t] - obs["robot0_base_to_eef_pos"])
 
         # collect transition
-        traj["obs"].append(obs)
+        # traj["obs"].append(obs)
         traj["rewards"].append(r)
         traj["dones"].append(done)
         traj["datagen_info"].append(datagen_info)
 
-    # convert list of dict to dict of list for obs dictionaries (for convenient writes to hdf5 dataset)
-    traj["obs"] = TensorUtils.list_of_flat_dict_to_dict_of_list(traj["obs"])
-    traj["datagen_info"] = TensorUtils.list_of_flat_dict_to_dict_of_list(
-        traj["datagen_info"]
-    )
+        sample = {
+            "obs": obs,
+            "rewards": r,
+            "dones": done,
+            "datagen_info": datagen_info,
+            "states": states[t],
+            "actions": actions[t],
+        }
 
-    # list to numpy array
-    for k in traj:
-        # if k == "initial_state_dict":
-        #     continue
-        if isinstance(traj[k], dict):
-            for kp in traj[k]:
-                if isinstance(traj[k][kp][0], dict):
-                    traj[k][kp] = TensorUtils.list_of_flat_dict_to_dict_of_list(
-                        traj[k][kp]
-                    )
-                    for kpp in traj[k][kp]:
-                        traj[k][kp][kpp] = np.array(traj[k][kp][kpp])
-                else:
-                    traj[k][kp] = np.array(traj[k][kp])
-        else:
-            traj[k] = np.array(traj[k])
+        if hdf5_file is None:
+            # create hdf5 file if it doesn't exist
+            hdf5_file = prepare_hdf5_file(args, output_path, sample, total_length=traj_len)
 
-    return traj
+        append_to_hdf5_file(hdf5_file, sample, t)
 
+        # find_largest_leaf(traj)
+    finish_hdf5_file(hdf5_file, traj, output_path, action_dict)
+    return traj, hdf5_file
 
-""" The process that writes over the generated files to memory """
-
-
-def write_traj_to_file(args, output_path, item):
-    f = h5py.File(args.dataset, "r")
-    f_out = h5py.File(output_path, "w")
-    start_time = time.time()
-
-    ep = item[0]
-    traj = item[1]
-    process_num = item[2]
-
-    f_out.create_dataset("actions", data=np.array(traj["actions"]))
-    if args.global_actions:
-        f_out.create_dataset("global_actions", data=np.array(traj["global_actions"]))
-    f_out.create_dataset("states", data=np.array(traj["states"]))
-    f_out.create_dataset("rewards", data=np.array(traj["rewards"]))
-    f_out.create_dataset("dones", data=np.array(traj["dones"]))
-
-    for k in traj["obs"]:
-        total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-        total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-        print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing {k}", flush=True)
-
-        if isinstance(traj["obs"][k], OrderedDict):
-            for kp in traj["obs"][k]:
-                data = np.array(traj["obs"][k][kp])
-                if args.no_compress:
-                    f_out.create_dataset(f"obs/{k}/{kp}", data=data)
-                else:
-                    f_out.create_dataset(f"obs/{k}/{kp}", data=data, compression="gzip", chunks=True)
-                del data
-                gc.collect()
-            continue
-
-        data = np.array(traj["obs"][k])
-        if args.no_compress:
-            f_out.create_dataset(f"obs/{k}", data=data)
-        else:
-            f_out.create_dataset(f"obs/{k}", data=data, compression="gzip", chunks=True)
-        del data
-        gc.collect()
-
-        if args.include_next_obs:
-            data = np.array(traj["next_obs"][k])
-            if args.no_compress:
-                f_out.create_dataset(f"next_obs/{k}", data=data)
-            else:
-                f_out.create_dataset(f"next_obs/{k}", data=data, compression="gzip")
-            del data
-            gc.collect()
-
-    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing datagen_info", flush=True)
-    if "datagen_info" in traj:
-        for k in traj["datagen_info"]:
-            data = np.array(traj["datagen_info"][k])
-            f_out.create_dataset(f"datagen_info/{k}", data=data)
-            del data
-            gc.collect()
-
-    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing action_dict", flush=True)
-    if "data/{}/action_dict".format(ep) in f:
-        action_dict = f["data/{}/action_dict".format(ep)]
-        for k in action_dict:
-            data = np.array(action_dict[k][()])
-            f_out.create_dataset(f"action_dict/{k}", data=data)
-            del data
-            gc.collect()
-
-    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing initial_state_dict/model", flush=True)
-    f_out.attrs["model_file"] = str(traj["initial_state_dict"]["model"])
-    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing initial_state_dict/ep_meta", flush=True)
-    f_out.attrs["ep_meta"] = str(traj["initial_state_dict"]["ep_meta"])
-    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before writing num_samples", flush=True)
-    f_out.attrs["num_samples"] = traj["actions"].shape[0]
-
-    total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-    total_swap, used_swap, free_swap = map(int, os.popen("free -m | awk '/Swap/ {print $2, $3, $4}'").read().split())
-    print(f"{used_memory}/{total_memory} | {used_swap}/{total_swap} before closing", flush=True)
-    f_out.close()
-    f.close()
-
-    DatasetUtils.extract_action_dict(dataset=output_path)
-    print("Writing has finished")
-
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Time elapsed: {elapsed_time:.2f} seconds")
-    return
-
+"""Write observations to hdf5 file"""
 
 def retrieve_new_index(work_queue):
     try:
@@ -323,6 +353,12 @@ def extract_multiple_trajectories(
         # print("Running {} index".format(ind))
         ep = demos[ind]
 
+        out_file = os.path.join(output_folder, f"processed_{ep}.hdf5")
+
+        # if "processed_demo_10.hdf5" not in out_file:
+        #     ind = retrieve_new_index(work_queue)
+        #     continue
+
         # prepare initial state to reload from
         states = f["data/{}/states".format(ep)][()]
         initial_state = dict(states=states[0])
@@ -333,15 +369,19 @@ def extract_multiple_trajectories(
 
         # extract obs, rewards, dones
         actions = f["data/{}/actions".format(ep)][()]
+        action_dict= f["data/{}/action_dict".format(ep)]
 
         traj = extract_trajectory(
             env=env,
             initial_state=initial_state,
             states=states,
             actions=actions,
+            action_dict=action_dict,
             done_mode=args.done_mode,
             add_datagen_info=args.add_datagen_info,
+            output_path=out_file,
             args=args,
+            ep=ep
         )
 
         # maybe copy reward or done signal from source file
@@ -358,19 +398,7 @@ def extract_multiple_trajectories(
         initial_state["ep_meta"] = ep_grp.attrs.get("ep_meta", None)
 
         # store transitions
-
-        # IMPORTANT: keep name of group the same as source file, to make sure that filter keys are
-        #            consistent as well
-        # print("(process {}): ADD TO QUEUE index {}".format(process_num, ind))
-        total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-        print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total before putting {ep} at process {process_num}", flush=True)
-
-        # mul_queue.put([ep, traj, process_num])
-        out_file = os.path.join(output_folder, f"processed_{ep}.hdf5")
-        write_traj_to_file(args, out_file, [ep, traj, process_num])
-
-        total_memory, used_memory, free_memory = map(int, os.popen('free -t -m').readlines()[-1].split()[1:])
-        print(f"Memory usage: {used_memory}MB used out of {total_memory}MB total after putting {ep} at process {process_num}", flush=True)
+        # write_traj_to_file(args, out_file, [ep, traj, process_num])
 
         ind = retrieve_new_index(work_queue)
 
@@ -398,28 +426,15 @@ def dataset_states_to_obs_multiprocessing(args):
     # create environment to use for data processing
 
     # output file in same directory as input file
-    output_name = args.output_name
-    if output_name is None:
-        if len(args.camera_names) == 0:
-            output_name = os.path.basename(args.dataset)[:-5] + "_ld.hdf5"
-        else:
-            image_suffix = str(args.camera_width)
-            image_suffix = (
-                image_suffix + "_randcams" if args.randomize_cameras else image_suffix
-            )
-            if args.generative_textures:
-                output_name = os.path.basename(args.dataset)[
-                    :-5
-                ] + "_gentex_im{}.hdf5".format(image_suffix)
-            else:
-                output_name = os.path.basename(args.dataset)[:-5] + "_im{}.hdf5".format(
-                    image_suffix
-                )
+    output_folder = args.output_folder
+    if output_folder is None:
+        output_folder = os.path.dirname(args.dataset)
 
-    output_path = os.path.join(os.path.dirname(args.dataset), output_name)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
 
     print("input file: {}".format(args.dataset))
-    print("output file: {}".format(output_path))
+    print("output folder: {}".format(output_folder))
 
     f = h5py.File(args.dataset, "r")
     if args.filter_key is not None:
@@ -447,29 +462,19 @@ def dataset_states_to_obs_multiprocessing(args):
         work_queue.put(index)
 
     processes = []
-    for i in range(num_processes):
-        process = multiprocessing.Process(
-            target=extract_multiple_trajectories,
-            args=(
-                i,
-                args,
-                work_queue,
-            ),
-        )
-        processes.append(process)
+    # for i in range(num_processes):
+    #     process = multiprocessing.Process(
+    #         target=extract_multiple_trajectories,
+    #         args=(
+    #             i,
+    #             args,
+    #             work_queue,
+    #             output_folder
+    #         ),
+    #     )
+    #     processes.append(process)
 
-    # extract_multiple_trajectories(0, args, work_queue, output_folder=os.path.dirname(args.dataset))
-
-    # process1 = multiprocessing.Process(
-    #     target=write_traj_to_file,
-    #     args=(
-    #         args,
-    #         output_path,
-    #         num_demos,
-    #         mul_queue,
-    #     ),
-    # )
-    # processes.append(process1)
+    extract_multiple_trajectories(0, args, work_queue, output_folder)
 
     for process in processes:
         process.start()
@@ -493,7 +498,7 @@ if __name__ == "__main__":
     )
     # name of hdf5 to write - it will be in the same directory as @dataset
     parser.add_argument(
-        "--output_name",
+        "--output_folder",
         type=str,
         help="name of output hdf5 dataset",
     )

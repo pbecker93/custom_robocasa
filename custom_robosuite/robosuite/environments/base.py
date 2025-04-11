@@ -328,8 +328,12 @@ class MujocoEnv(metaclass=EnvMeta):
 
                 # Set the camera angle for viewing
                 if self.render_camera is not None:
-                    camera_id = self.sim.model.camera_name2id(self.render_camera)
-                    self.viewer.set_camera(camera_id)
+                    camera_ids = []
+                    for cam in self.render_camera:
+                        camera_id = self.sim.model.camera_name2id(cam)
+                        camera_ids.append(camera_id)
+                    self.viewer.set_camera(camera_ids)
+
 
             elif self.renderer == "mjviewer":
                 self.initialize_renderer()

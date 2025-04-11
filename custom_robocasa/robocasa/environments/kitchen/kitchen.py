@@ -7,6 +7,7 @@ import numpy as np
 import robosuite.utils.transform_utils as T
 from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
 from robosuite.models.tasks import ManipulationTask
+from robosuite.models.tasks.task import get_subtree_geom_ids_by_group
 from robosuite.utils.errors import RandomizationError
 from robosuite.utils.mjcf_utils import (
     array_to_string,
@@ -1179,6 +1180,13 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
         for (name, model) in self.objects.items():
             self.obj_body_id[name] = self.sim.model.body_name2id(model.root_body)
 
+        self.obj_body_recursive_ids = {}
+        for (name, model) in self.objects.items():
+            self.obj_body_recursive_ids[name] = get_subtree_geom_ids_by_group(self.sim.model, self.obj_body_id[name], group=1)
+
+        pass
+
+    # model: mujoco.MjModel, body_id: int, group: int
     def _setup_observables(self):
         """
         Sets up observables to be used for this environment. Creates object-based observables if enabled
@@ -1339,6 +1347,31 @@ class Kitchen(ManipulationEnv, metaclass=KitchenEnvMeta):
             ]
         )
         return action_abs
+
+    def convert_abs_to_rel_action(self, abs_action):
+        # Get the current absolute pose of the robot's right arm
+        robot = self.robots[0]
+        current_pose = robot.composite_controller.part_controllers["right"].goal_origin_to_eef_pose()
+        current_pos = current_pose[:3, 3]
+        current_ori = current_pose[:3, :3]
+        current_ori_vec = Rotation.from_matrix(current_ori).as_rotvec()
+
+        # Extract desired absolute position and orientation from abs_action.
+        # Assume abs_action is organized as:
+        # [desired_x, desired_y, desired_z, desired_rotvec (3,), extra_components...]
+        desired_pos = abs_action[:3]
+        desired_ori_vec = abs_action[3:6]
+
+        # Compute the relative differences
+        rel_pos = desired_pos - current_pos
+        rel_ori = desired_ori_vec - current_ori_vec  # difference in rotation vector
+
+        # Include any extra action components (e.g., gripper command)
+        extra = abs_action[6:]
+
+        # Concatenate to form the relative action
+        rel_action = np.hstack([rel_pos, rel_ori, extra])
+        return rel_action
 
     def update_state(self):
         """

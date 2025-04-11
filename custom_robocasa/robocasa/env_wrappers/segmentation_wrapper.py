@@ -28,7 +28,7 @@ ENV_CONFIG = {
         "include_obj": True
     },
     "PnPCounterToStove": {
-        "classes": ["Counter", "Stove", "Stovetop"],
+        "classes": ["Counter", "Stove", "Stovetop", "container"],
         "include_obj": True
     },
     "PnPStoveToCounter": {
@@ -135,7 +135,7 @@ class SegmentationWrapper(gym.Wrapper):
                 # Broadcasting comparison over the last axis, then taking any() along that axis.
                 # masks[cam][class_name] = (segmentation[..., None] == geom_ids_arr).any(axis=-1)
 
-                masks[cam][class_name] = np.isin(segmentation, geom_ids)
+                masks[cam][class_name] = np.isin(segmentation, geom_ids_arr)
                 # masks[cam][class_name] = masks[cam][class_name].squeeze()
 
         return masks
@@ -146,6 +146,10 @@ class SegmentationWrapper(gym.Wrapper):
         if self.include_obj:
             obj_body_id = self.env.obj_body_id["obj"]
             geom_ids["obj"] = [geom_id for geom_id in range(self.env.sim.model.ngeom) if self.env.sim.model.geom_bodyid[geom_id] == obj_body_id]
+
+        for obj_body_key, obj_body_id in self.env.obj_body_recursive_ids.items():
+            if obj_body_key != "obj":
+                geom_ids[obj_body_key] = self.env.obj_body_recursive_ids[obj_body_key]
 
         for class_name in self.classes:
             if class_name in self.env.model.classes_to_ids:

@@ -10,11 +10,6 @@ class CameraInfoWrapper(gym.Wrapper):
     def step(self, action):
         obs_dict, reward, done, info = self.env.step(action)
 
-        if self.get_normal_pc:
-            obs_dict["point_cloud"] = self.get_point_cloud(obs_dict)
-        if self.get_segmented_pc:
-            obs_dict["segmented_point_cloud"] = self.get_segmented_point_cloud(obs_dict)
-
         return obs_dict, reward, done, info
 
     def reset(self):
@@ -37,8 +32,12 @@ class CameraInfoWrapper(gym.Wrapper):
 
         intrinsic_matrices = {f"{cam}_intrinsics": get_camera_intrinsic_matrix(self.env.sim, cam, camera_height=heights[cam], camera_width=widths[cam]) for cam in self.cam_names}
         extrinsic_matrices = {f"{cam}_extrinsics": get_camera_extrinsic_matrix(self.env.sim, cam) for cam in self.cam_names}
+        base_poses = {
+            "base_pos": self.env.sim.data.get_site_xpos(f"mobilebase0_center"),
+            "base_rot": self.env.sim.data.get_site_xmat(f"mobilebase0_center"),
+        }
 
-        return intrinsic_matrices | extrinsic_matrices
+        return intrinsic_matrices | extrinsic_matrices | base_poses
 
     def _check_success(self):
         return self.env._check_success()
