@@ -88,13 +88,16 @@ class SegmentationWrapper(gym.Wrapper):
         self.classes = ENV_CONFIG[env_name]["classes"] + ["PandaOmron", "PandaGripper"]
         self.include_obj = ENV_CONFIG[env_name]["include_obj"]
 
+        self.segmentation_active = True
+
     def step(self, action):
         obs_dict, reward, done, info = self.env.step(action)
 
-        segmentation_masks = self.get_segmentation_mask(obs_dict)
+        if self.segmentation_active:
+            segmentation_masks = self.get_segmentation_mask(obs_dict)
 
-        for cam, mask in segmentation_masks.items():
-            obs_dict[f"{cam}_segmentation_mask"] = mask
+            for cam, mask in segmentation_masks.items():
+                obs_dict[f"{cam}_segmentation_mask"] = mask
 
         return obs_dict, reward, done, info
 
@@ -156,6 +159,12 @@ class SegmentationWrapper(gym.Wrapper):
                 geom_ids[class_name] = self.env.model.classes_to_ids[class_name]["geom"]
 
         return geom_ids
+
+    def activate_segmentation(self):
+        self.segmentation_active = True
+
+    def deactivate_segmentation(self):
+        self.segmentation_active = False
 
     def _check_success(self):
         return self.env._check_success()
