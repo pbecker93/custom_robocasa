@@ -67,7 +67,8 @@ def prepare_hdf5_file(args, output_path, init_sample, total_length = 0, use_in_m
     Prepares the HDF5 file for writing by creating the necessary groups and datasets.
     """
     if use_in_memory:
-        f_out = h5py.File.in_memory()
+        # everything lives in RAM; nothing hits disk until we explicitly grab it
+        f_out = h5py.File(output_path, "w", driver="core", backing_store=False)
     else:
         f_out = h5py.File(output_path, "w")
     f_out.create_group("obs")
@@ -78,8 +79,8 @@ def prepare_hdf5_file(args, output_path, init_sample, total_length = 0, use_in_m
     f_out.create_dataset("rewards", (total_length,), maxshape=(total_length,), chunks=True, compression=compression)
     f_out.create_dataset("dones", (total_length,), maxshape=(total_length,), chunks=True, compression=compression)
 
-    f_out.create_dataset("actions", (total_length,*init_sample["actions"].shape), maxshape=(total_length,*init_sample["actions"].shape), chunks=True, compression=compression)
-    f_out.create_dataset("states", maxshape=(total_length,*init_sample["states"].shape), chunks=True, shape=(total_length, *init_sample["states"].shape), compression=compression)
+    f_out.create_dataset("actions", (total_length,*init_sample["actions"].shape), maxshape=(total_length,*init_sample["actions"].shape), chunks=(1, *init_sample["actions"].shape), compression=compression)
+    f_out.create_dataset("states", maxshape=(total_length,*init_sample["states"].shape), chunks=(1, *init_sample["states"].shape), shape=(total_length, *init_sample["states"].shape), compression=compression)
 
 
     for k, v in init_sample["obs"].items():
@@ -91,6 +92,44 @@ def prepare_hdf5_file(args, output_path, init_sample, total_length = 0, use_in_m
                 f_out.create_dataset(f"obs/{k}/{sub_k}", maxshape=(total_length, *sub_v.shape), chunks=(1, *sub_v.shape), compression=compression, shape=(total_length, *sub_v.shape), dtype=dtype)
 
     return f_out
+
+def prepare_dict_for_hdf5_file(args, init_sample):
+    hdf5_dict = {}
+    hdf5_dict["rewards"] = []
+    hdf5_dict["dones"] = []
+
+    hdf5_dict["actions"] = []
+    hdf5_dict["states"] = []
+
+    hdf5_dict["obs"] = {}
+    for k, v in init_sample["obs"].items():
+        if isinstance(v, np.ndarray):
+            hdf5_dict["obs"][k] = []
+        elif isinstance(v, dict):
+            hdf5_dict["obs"][k] = {}
+            for sub_k, sub_v in v.items():
+                hdf5_dict["obs"][k][sub_k] = []
+
+    return hdf5_dict
+
+def append_to_hdf5_dict(hdf5_dict, data, index):
+    """
+    Appends data to the HDF5 dictionary.
+    """
+    # Rewards
+    hdf5_dict["rewards"].append(data["rewards"])
+    hdf5_dict["dones"].append(data["dones"])
+    hdf5_dict["states"].append(data["states"])
+    # Actions
+    hdf5_dict["actions"].append(data["actions"])
+
+    # Observations
+    for k, v in data["obs"].items():
+        if isinstance(v, np.ndarray):
+            hdf5_dict["obs"][k].append(v)
+        elif isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                hdf5_dict["obs"][k][sub_k].append(sub_v)
 
 def append_to_hdf5_file(f_out, data, index):
     """
@@ -118,6 +157,44 @@ def append_to_hdf5_file(f_out, data, index):
                 else:
                     f_obs[f"{k}/{sub_k}"][index] = sub_v
 
+def finish_hdf5_file_from_dict(hdf5_dict, output_path, args):
+    """
+    Prepares the HDF5 file for writing by creating the necessary groups and datasets.
+    """
+    f_out = h5py.File(output_path, "w")
+    f_out.create_group("obs")
+    f_out.create_group("action_dict")
+
+    compression = "gzip" if not args.no_compress else None
+
+    rewards = np.asarray(hdf5_dict["rewards"])
+    f_out.create_dataset("rewards", data=rewards, chunks=True, compression=compression)
+
+    dones = np.asarray(hdf5_dict["dones"])
+    f_out.create_dataset("dones", data=dones, chunks=True, compression=compression)
+
+    actions = np.asarray(hdf5_dict["actions"])
+    f_out.create_dataset("actions", data=actions, chunks=True, compression=compression)
+
+    states = np.asarray(hdf5_dict["states"])
+    f_out.create_dataset("states", data=states, chunks=True, compression=compression)
+
+    for k, v in hdf5_dict["obs"].items():
+        if isinstance(v, list):
+            np_value = np.asarray(v)
+            f_out.create_dataset(f"obs/{k}", data=np_value, chunks=True, compression=compression)
+        elif isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                np_value = np.asarray(sub_v)
+                f_out.create_dataset(f"obs/{k}/{sub_k}", data=np_value, chunks=True, compression=compression)
+
+    f_out.close()
+
+    DatasetUtils.sync_extract_action_dict(dataset=output_path)
+    print(f"Writing has finished ${output_path}")
+    return #f_out
+
+
 def finish_hdf5_file(f_out, traj, output_path, action_dict):
     """
     Finalizes the HDF5 file by closing it.
@@ -132,12 +209,18 @@ def finish_hdf5_file(f_out, traj, output_path, action_dict):
     f_out.attrs["ep_meta"] = str(traj["initial_state_dict"]["ep_meta"])
     f_out.attrs["num_samples"] = traj["actions"].shape[0]
 
+    # write everything into the in‑memory file
+    if f_out.driver == "core":
+        # pull the HDF5 binary image out of RAM
+        img = f_out.id.get_file_image()
+        # write it down once, here at the end
+        with open(output_path, "wb") as disk_f:
+            disk_f.write(img)
+
     f_out.close()
 
     DatasetUtils.sync_extract_action_dict(dataset=output_path)
     print(f"Writing has finished ${output_path}")
-
-    f_out.close()
 
 def extract_trajectory(
     env,
@@ -204,7 +287,7 @@ def extract_trajectory(
         next_obs=[],
         rewards=[],
         dones=[],
-        actions=np.array(actions),\
+        actions=np.array(actions),
         # actions_abs=[],
         states=np.array(states),
         initial_state_dict=initial_state,
@@ -215,8 +298,9 @@ def extract_trajectory(
 
     # hdf5 file to write to
     hdf5_file = None
+    hdf5_dict = None
 
-    traj_len = states.shape[0]
+    traj_len = 20 #states.shape[0]
     # iteration variable @t is over "next obs" indices
     for t in tqdm(range(traj_len)):
         obs = deepcopy(env.reset_to({"states": states[t]}))
@@ -269,9 +353,9 @@ def extract_trajectory(
         # print("rel_action2", rel_action2)
         # print("diff", action_abs - action_abs2)
 
-        print("action_abs", action_dict["abs_pos"][t])
-        print("robot0_base_to_eef_pos", obs["robot0_base_to_eef_pos"])
-        print("diff", action_dict["abs_pos"][t] - obs["robot0_base_to_eef_pos"])
+        # print("action_abs", action_dict["abs_pos"][t])
+        # print("robot0_base_to_eef_pos", obs["robot0_base_to_eef_pos"])
+        # print("diff", action_dict["abs_pos"][t] - obs["robot0_base_to_eef_pos"])
 
         # collect transition
         # traj["obs"].append(obs)
@@ -288,15 +372,19 @@ def extract_trajectory(
             "actions": actions[t],
         }
 
-        if hdf5_file is None:
+        if hdf5_dict is None:
             # create hdf5 file if it doesn't exist
-            hdf5_file = prepare_hdf5_file(args, output_path, sample, total_length=traj_len)
+            # hdf5_file = prepare_hdf5_file(args, output_path, sample, total_length=traj_len, use_in_memory=args.use_in_memory)
+            hdf5_dict = prepare_dict_for_hdf5_file(args, sample)
 
-        append_to_hdf5_file(hdf5_file, sample, t)
+        # append_to_hdf5_file(hdf5_file, sample, t)
+        append_to_hdf5_dict(hdf5_dict, sample, t)
 
         # find_largest_leaf(traj)
-    finish_hdf5_file(hdf5_file, traj, output_path, action_dict)
+    # finish_hdf5_file(hdf5_file, traj, output_path, action_dict)
+    f_out = finish_hdf5_file_from_dict(hdf5_dict, output_path, args)
     return traj, hdf5_file
+
 
 """Write observations to hdf5 file"""
 
@@ -354,6 +442,10 @@ def extract_multiple_trajectories(
         ep = demos[ind]
 
         out_file = os.path.join(output_folder, f"processed_{ep}.hdf5")
+
+        if os.path.exists(out_file):
+            ind = retrieve_new_index(work_queue)
+            continue
 
         # if "processed_demo_10.hdf5" not in out_file:
         #     ind = retrieve_new_index(work_queue)
@@ -459,6 +551,8 @@ def dataset_states_to_obs_multiprocessing(args):
 
     work_queue = multiprocessing.Queue()
     for index in range(num_demos):
+        # if "17" not in demos[index] and "18" not in demos[index]:
+        #     continue
         work_queue.put(index)
 
     processes = []
@@ -657,6 +751,12 @@ if __name__ == "__main__":
         "--dont_store_depth",
         action="store_true",
         help="whether to store depth observations",
+    )
+
+    parser.add_argument(
+        "--use_in_memory",
+        action="store_true",
+        help="whether to use in-memory hdf5 file",
     )
 
     args = parser.parse_args()
