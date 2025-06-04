@@ -5,7 +5,9 @@ Adapted from robomimic's dataset_states_to_obs.py script.
 import gc
 import os
 import json
-from typing import OrderedDict
+from typing import OrderedDict, Dict
+
+import cv2
 import h5py
 import argparse
 import numpy as np
@@ -14,6 +16,9 @@ import multiprocessing
 import queue
 import time
 import traceback
+
+import torch
+import yaml
 
 from robocasa.env_wrappers.camera_info_wrapper import CameraInfoWrapper
 from robocasa.utils.env_utils import create_env
@@ -29,6 +34,7 @@ from robocasa.utils.transform_utils import (
     quat2axisangle_numpy,
     quat2mat_numpy,
 )
+import robocasa.utils.robomimic.robomimic_torch_utils as TorchUtils
 
 # from robomimic.utils.log_utils import log_warning
 
@@ -194,6 +200,63 @@ def finish_hdf5_file_from_dict(hdf5_dict, output_path, args):
     print(f"Writing has finished ${output_path}")
     return #f_out
 
+def convert_actions_to_dict(action_rel, action_abs):
+    # find files
+    SPECS = [
+        dict(
+            key="actions",
+            is_absolute=False,
+        ),
+        dict(
+            key="actions_abs",
+            is_absolute=True,
+        ),
+    ]
+
+    demo_dict = {
+        "actions": action_rel,
+        "actions_abs": action_abs,
+    }
+
+    action_dict = {}
+
+    # execute
+    for spec in SPECS:
+        input_action_key = spec["key"]
+        is_absolute = spec["is_absolute"]
+
+        if is_absolute:
+            prefix = "abs_"
+        else:
+            prefix = "rel_"
+
+        if str(input_action_key) not in demo_dict.keys():
+            continue
+        in_action = demo_dict[str(input_action_key)][:]
+        in_pos = in_action[:, :3].astype(np.float32)
+        in_rot = in_action[:, 3:6].astype(np.float32)
+        in_grip = in_action[:, 6:7].astype(np.float32)
+
+        rot_6d = TorchUtils.axis_angle_to_rot_6d(
+            axis_angle=torch.from_numpy(in_rot)
+        )
+        rot_6d = rot_6d.numpy().astype(np.float32)  # convert to numpy
+
+        this_action_dict = {
+            prefix + "pos": in_pos,
+            prefix + "rot_axis_angle": in_rot,
+            prefix + "rot_6d": rot_6d,
+            "gripper": in_grip,
+        }
+
+        # special case: 8 dim actions mean there is a mobile base mode in the action space
+        if in_action.shape[1] == 8:
+            this_action_dict["base_mode"] = in_action[:, 7:8].astype(np.float32)
+
+        action_dict.update(this_action_dict)
+    
+    return action_dict
+
 
 def finish_hdf5_file(f_out, traj, output_path, action_dict):
     """
@@ -230,9 +293,10 @@ def extract_trajectory(
     action_dict,
     done_mode,
     args,
-    output_path,
+    output_folder,
     ep,
     add_datagen_info=False,
+    config: Dict = None,
 ):
     """
     Helper function to extract observations, rewards, and dones along a trajectory using
@@ -296,11 +360,8 @@ def extract_trajectory(
     if args.global_actions:
         traj["global_actions"] = np.array(global_actions)
 
-    # hdf5 file to write to
-    hdf5_file = None
-    hdf5_dict = None
 
-    traj_len = 20 #states.shape[0]
+    traj_len = states.shape[0]
     # iteration variable @t is over "next obs" indices
     for t in tqdm(range(traj_len)):
         obs = deepcopy(env.reset_to({"states": states[t]}))
@@ -340,28 +401,13 @@ def extract_trajectory(
             done = done or env._check_success()
         done = int(done)
 
-        # get the absolute action
-        local_action = np.zeros_like(actions[t])
-        action_abs = env.convert_rel_to_abs_action(local_action).copy() #actions[t])
-        action_abs2 = env.convert_rel_to_abs_action(actions[t]).copy()
-        rel_action = env.convert_abs_to_rel_action(action_abs2)
-        rel_action2 = actions[t]
-        #
-        # print("action_abs", action_abs)
-        # print("action_abs2", action_abs2)
-        # print("rel_action", rel_action)
-        # print("rel_action2", rel_action2)
-        # print("diff", action_abs - action_abs2)
-
-        # print("action_abs", action_dict["abs_pos"][t])
-        # print("robot0_base_to_eef_pos", obs["robot0_base_to_eef_pos"])
-        # print("diff", action_dict["abs_pos"][t] - obs["robot0_base_to_eef_pos"])
-
         # collect transition
         # traj["obs"].append(obs)
         traj["rewards"].append(r)
         traj["dones"].append(done)
         traj["datagen_info"].append(datagen_info)
+
+        local_action_dict = {action_key: action_dict[action_key][t] for action_key in action_dict}
 
         sample = {
             "obs": obs,
@@ -370,20 +416,107 @@ def extract_trajectory(
             "datagen_info": datagen_info,
             "states": states[t],
             "actions": actions[t],
+            "action_dict": local_action_dict,
         }
 
-        if hdf5_dict is None:
-            # create hdf5 file if it doesn't exist
-            # hdf5_file = prepare_hdf5_file(args, output_path, sample, total_length=traj_len, use_in_memory=args.use_in_memory)
-            hdf5_dict = prepare_dict_for_hdf5_file(args, sample)
+        write_sample_to_folders(sample, output_folder, t, config)
+    return
 
-        # append_to_hdf5_file(hdf5_file, sample, t)
-        append_to_hdf5_dict(hdf5_dict, sample, t)
+def write_sample_to_folders(sample: Dict, output_folder: str, index: int, config: Dict):
+    """
+    Write a single sample to the output folder.
+    """
+   # Create empty config.json
+    config_file = os.path.join(output_folder, "config.json")
+    open(config_file, 'a').close()
 
-        # find_largest_leaf(traj)
-    # finish_hdf5_file(hdf5_file, traj, output_path, action_dict)
-    f_out = finish_hdf5_file_from_dict(hdf5_dict, output_path, args)
-    return traj, hdf5_file
+    # Intrinsics and extrinsics per timestep
+    intrinsics_keys = [key for key in sample["obs"].keys() if "intrinsics" in key or "extrinsics" in key]
+    cam_info_subfolder = os.path.join(output_folder, "cam_info")
+    os.makedirs(cam_info_subfolder, exist_ok=True)
+    cam_info_dict = {key: sample["obs"][key].flatten().tolist() for key in intrinsics_keys}
+    out_file = os.path.join(cam_info_subfolder, f"{index:04d}.yaml")
+    with open(out_file, "w") as f:
+        yaml.dump(cam_info_dict, f)
+
+
+    # Extract camera intrinsics once
+    camera_intrinsics = {}
+    for key in sample["obs"].keys():
+        if "intrinsics" in key:
+            camera_intrinsics[key] = np.array(sample["obs"][key]).flatten().tolist()
+
+    intrinsics_file = os.path.join(output_folder, "intrinsic.json")
+    with open(intrinsics_file, "w") as f:
+        json.dump(camera_intrinsics, f, indent=4)
+
+    robot_base_pos = sample["obs"]["robot0_base_pos"]
+    robot_base_quat = sample["obs"]["robot0_base_quat"]
+    base_pos = sample["obs"]["base_pos"]
+    base_rot = sample["obs"]["base_rot"]
+    robot_base_pose = np.concatenate([robot_base_pos, robot_base_quat], axis=-1)
+    states_subfolder = os.path.join(output_folder, config["states_subfolder"])
+    os.makedirs(states_subfolder, exist_ok=True)
+    state_dict = {}
+    state_dict["robot_base_pose"] = robot_base_pose.flatten().tolist()
+    state_dict["robot_base_pos"] = robot_base_pos.flatten().tolist()
+    state_dict["robot_base_quat"] = robot_base_quat.flatten().tolist()
+    state_dict["base_pos"] = base_pos.flatten().tolist()
+    state_dict["base_rot"] = base_rot.flatten().tolist()
+    out_file = os.path.join(states_subfolder, f"{index:04d}.yaml")
+    with open(out_file, "w") as f:
+        yaml.dump(state_dict, f)
+
+    # Actions:
+    in_action_dict = sample["action_dict"]
+
+    subfolder = os.path.join(output_folder, config["action_subfolder"])
+    os.makedirs(subfolder, exist_ok=True)
+
+    action_len = in_action_dict[list(in_action_dict.keys())[0]].shape[0]
+    action_dict = {}
+    for key in in_action_dict.keys():
+        action_dict[key] = np.array(in_action_dict[key]).tolist()
+    out_file = os.path.join(subfolder, f"{index:04d}.yaml")
+    with open(out_file, "w") as f:
+        yaml.dump(action_dict, f)
+
+    # Extract images:
+    for key in sample["obs"].keys():
+        if not "robot0_agentview" in key:
+            continue
+
+        subfolder = os.path.join(output_folder, key)
+
+        if "image" in key:
+            os.makedirs(subfolder, exist_ok=True)
+
+            rgb = np.asarray(sample["obs"][key])
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+            rgb_file = os.path.join(subfolder, f"{index:04d}.png")
+            cv2.imwrite(rgb_file, rgb)
+
+
+        if "depth" in key:
+            os.makedirs(subfolder, exist_ok=True)
+
+            depth = np.asarray(sample["obs"][key])
+
+            depth = (depth * 1000.0).astype(np.uint16)
+
+            depth_file = os.path.join(subfolder, f"{index:04d}.png")
+            cv2.imwrite(depth_file, depth)
+
+        if "segmentation" in key:
+            os.makedirs(subfolder, exist_ok=True)
+            for subkey in sample["obs"][key].keys():
+                subsubfolder = os.path.join(subfolder, subkey)
+                os.makedirs(subsubfolder, exist_ok=True)
+
+                seg = np.asarray(sample["obs"][key][subkey]) * 255
+                seg_file = os.path.join(subsubfolder, f"{index:04d}.png")
+                cv2.imwrite(seg_file, seg)
+
 
 
 """Write observations to hdf5 file"""
@@ -397,7 +530,7 @@ def retrieve_new_index(work_queue):
 
 
 def extract_multiple_trajectories(
-    process_num, args, work_queue, output_folder=None
+    process_num, args, work_queue, config
 ):
     # create environment to use for data processing
 
@@ -413,11 +546,6 @@ def extract_multiple_trajectories(
         env_meta["env_kwargs"]["randomize_cameras"] = True
     env = create_env_with_wrappers(env_meta["env_name"], args)
 
-    start_time = time.time()
-
-    # print("==== Using environment with the following metadata ====")
-    # print(json.dumps(env.serialize(), indent=4))
-    # print("")
 
     # list of all demonstration episodes (sorted in increasing number order)
     f = h5py.File(args.dataset, "r")
@@ -436,20 +564,16 @@ def extract_multiple_trajectories(
     if args.n is not None:
         demos = demos[: args.n]
 
+    demonstrations_folder = config["demonstrations_folder"]
+    os.makedirs(demonstrations_folder, exist_ok=True)
+
     ind = retrieve_new_index(work_queue)
-    while (not work_queue.empty()) and (ind != -1):
+    while ind != -1:
         # print("Running {} index".format(ind))
         ep = demos[ind]
 
-        out_file = os.path.join(output_folder, f"processed_{ep}.hdf5")
-
-        if os.path.exists(out_file):
-            ind = retrieve_new_index(work_queue)
-            continue
-
-        # if "processed_demo_10.hdf5" not in out_file:
-        #     ind = retrieve_new_index(work_queue)
-        #     continue
+        out_demo_folder = os.path.join(demonstrations_folder, f"processed_{ep}")
+        os.makedirs(out_demo_folder, exist_ok=True)
 
         # prepare initial state to reload from
         states = f["data/{}/states".format(ep)][()]
@@ -461,9 +585,14 @@ def extract_multiple_trajectories(
 
         # extract obs, rewards, dones
         actions = f["data/{}/actions".format(ep)][()]
-        action_dict= f["data/{}/action_dict".format(ep)]
+        if "action_dict" in f["data/{}".format(ep)]:
+            action_dict= f["data/{}/action_dict".format(ep)]
+        else:
+            action_rel = f["data/{}/actions".format(ep)]
+            action_abs = f["data/{}/actions_abs".format(ep)]
+            action_dict = convert_actions_to_dict(action_rel, action_abs)
 
-        traj = extract_trajectory(
+        extract_trajectory(
             env=env,
             initial_state=initial_state,
             states=states,
@@ -471,26 +600,11 @@ def extract_multiple_trajectories(
             action_dict=action_dict,
             done_mode=args.done_mode,
             add_datagen_info=args.add_datagen_info,
-            output_path=out_file,
+            output_folder=out_demo_folder,
             args=args,
-            ep=ep
+            ep=ep,
+            config=config,
         )
-
-        # maybe copy reward or done signal from source file
-        if args.copy_rewards:
-            traj["rewards"] = f["data/{}/rewards".format(ep)][()]
-        if args.copy_dones:
-            traj["dones"] = f["data/{}/dones".format(ep)][()]
-
-        ep_grp = f["data/{}".format(ep)]
-
-        states = ep_grp["states"][()]
-        initial_state = dict(states=states[0])
-        initial_state["model"] = ep_grp.attrs["model_file"]
-        initial_state["ep_meta"] = ep_grp.attrs.get("ep_meta", None)
-
-        # store transitions
-        # write_traj_to_file(args, out_file, [ep, traj, process_num])
 
         ind = retrieve_new_index(work_queue)
 
@@ -514,19 +628,10 @@ def create_env_with_wrappers(env_name, args):
     return env
 
 
-def dataset_states_to_obs_multiprocessing(args):
+def dataset_states_to_obs_multiprocessing(args, config: Dict):
     # create environment to use for data processing
-
-    # output file in same directory as input file
-    output_folder = args.output_folder
-    if output_folder is None:
-        output_folder = os.path.dirname(args.dataset)
-
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
     print("input file: {}".format(args.dataset))
-    print("output folder: {}".format(output_folder))
+    print("output folder: {}".format(config["demonstrations_folder"]))
 
     f = h5py.File(args.dataset, "r")
     if args.filter_key is not None:
@@ -563,12 +668,12 @@ def dataset_states_to_obs_multiprocessing(args):
     #             i,
     #             args,
     #             work_queue,
-    #             output_folder
+    #             config
     #         ),
     #     )
     #     processes.append(process)
 
-    extract_multiple_trajectories(0, args, work_queue, output_folder)
+    extract_multiple_trajectories(0, args, work_queue, config)
 
     for process in processes:
         process.start()
@@ -578,6 +683,123 @@ def dataset_states_to_obs_multiprocessing(args):
 
     print("Finished Multiprocessing")
     return
+
+def extract_robocasa(in_file: str, out_folder: str, config: dict):
+    in_hdf5 = h5py.File(in_file, "r")
+
+    # Create output folder if it doesn't exist
+    os.makedirs(out_folder, exist_ok=True)
+
+    in_obs = in_hdf5["obs"]
+
+    # Create empty config.json
+    config_file = os.path.join(out_folder, "config.json")
+    open(config_file, 'a').close()
+
+    intrinsics_keys = [key for key in in_obs.keys() if "intrinsics" in key or "extrinsics" in key]
+    cam_info_subfolder = os.path.join(out_folder, "cam_info")
+    os.makedirs(cam_info_subfolder, exist_ok=True)
+    for i in range(in_obs[intrinsics_keys[0]].shape[0]):
+        cam_info_dict = {key: in_obs[key][i].flatten().tolist() for key in intrinsics_keys}
+        out_file = os.path.join(cam_info_subfolder, f"{i:04d}.yaml")
+        with open(out_file, "w") as f:
+            yaml.dump(cam_info_dict, f)
+
+
+    # Extract camera intrinsics:
+    camera_intrinsics = {}
+    camera_extrinsics = {}
+    for key in in_obs.keys():
+        if "intrinsics" in key:
+            camera_intrinsics[key] = np.array(in_obs[key][0]).flatten().tolist()
+        if "extrinsics" in key:
+            camera_extrinsics[key] = np.array(in_obs[key][0]).flatten().tolist()
+
+    intrinsics_file = os.path.join(out_folder, "intrinsic.json")
+    with open(intrinsics_file, "w") as f:
+        json.dump(camera_intrinsics, f, indent=4)
+
+    extrinsics_file = os.path.join(out_folder, "extrinsic.json")
+    with open(extrinsics_file, "w") as f:
+        json.dump(camera_extrinsics, f, indent=4)
+
+    robot_base_pos = in_obs["robot0_base_pos"]
+    robot_base_quat = in_obs["robot0_base_quat"]
+    base_pos = in_obs["base_pos"]
+    base_rot = in_obs["base_rot"]
+    robot_base_pose = np.concatenate([robot_base_pos, robot_base_quat], axis=-1)
+    states_subfolder = os.path.join(out_folder, config["states_subfolder"])
+    os.makedirs(states_subfolder, exist_ok=True)
+    for i in range(robot_base_pose.shape[0]):
+        state_dict = {}
+        state_dict["robot_base_pose"] = robot_base_pose[i].flatten().tolist()
+        state_dict["robot_base_pos"] = robot_base_pos[i].flatten().tolist()
+        state_dict["robot_base_quat"] = robot_base_quat[i].flatten().tolist()
+        state_dict["base_pos"] = base_pos[i].flatten().tolist()
+        state_dict["base_rot"] = base_rot[i].flatten().tolist()
+        out_file = os.path.join(states_subfolder, f"{i:04d}.yaml")
+        with open(out_file, "w") as f:
+            yaml.dump(state_dict, f)
+
+    # Actions:
+    in_action_dict = in_hdf5["action_dict"]
+
+    subfolder = os.path.join(out_folder, config["action_subfolder"])
+    os.makedirs(subfolder, exist_ok=True)
+
+    action_len = in_action_dict[list(in_action_dict.keys())[0]].shape[0]
+    for i in range(action_len):
+        action_dict = {}
+        for key in in_action_dict.keys():
+            action_dict[key] = np.array(in_action_dict[key][i]).tolist()
+        out_file = os.path.join(subfolder, f"{i:04d}.yaml")
+        with open(out_file, "w") as f:
+            yaml.dump(action_dict, f)
+
+    # Extract images:
+    for key in tqdm.tqdm(in_obs.keys()):
+        if not "robot0_agentview" in key:
+            continue
+
+        subfolder = os.path.join(out_folder, key)
+
+        if "image" in key:
+            os.makedirs(subfolder, exist_ok=True)
+
+            images = np.asarray(in_obs[key])
+            for i in range(images.shape[0]):
+                rgb = images[i]
+                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                rgb_file = os.path.join(subfolder, f"{i:04d}.png")
+                cv2.imwrite(rgb_file, rgb)
+
+
+        if "depth" in key:
+            os.makedirs(subfolder, exist_ok=True)
+
+            depths = np.asarray(in_obs[key])
+            for i in range(depths.shape[0]):
+                depth = depths[i]
+
+                depth = (depth * 1000.0).astype(np.uint16)
+
+                depth_file = os.path.join(subfolder, f"{i:04d}.png")
+                cv2.imwrite(depth_file, depth)
+
+        if "segmentation" in key:
+            os.makedirs(subfolder, exist_ok=True)
+            for subkey in in_obs[key].keys():
+                subsubfolder = os.path.join(subfolder, subkey)
+                os.makedirs(subsubfolder, exist_ok=True)
+
+                segmentations = np.asarray(in_obs[key][subkey])
+                for i in range(segmentations.shape[0]):
+                    seg = segmentations[i] * 255
+                    seg_file = os.path.join(subsubfolder, f"{i:04d}.png")
+                    cv2.imwrite(seg_file, seg)
+
+
+    pass
 
 
 if __name__ == "__main__":
@@ -589,12 +811,6 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="path to input hdf5 dataset",
-    )
-    # name of hdf5 to write - it will be in the same directory as @dataset
-    parser.add_argument(
-        "--output_folder",
-        type=str,
-        help="name of output hdf5 dataset",
     )
 
     parser.add_argument(
@@ -759,5 +975,23 @@ if __name__ == "__main__":
         help="whether to use in-memory hdf5 file",
     )
 
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="/media/nic/LargeSandwich/kMPD/Datasets/robocasa_pnp_counter_to_stove/config_cotrack_dilated.yaml",
+    )
+
+
+
     args = parser.parse_args()
-    dataset_states_to_obs_multiprocessing(args)
+
+    with open(args.config, "r") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+
+    config_folder = os.path.dirname(args.config)
+    if not os.path.isabs(config["recordings_folder"]):
+        config["recordings_folder"] = os.path.join(config_folder, config["recordings_folder"])
+    if not os.path.isabs(config["demonstrations_folder"]):
+        config["demonstrations_folder"] = os.path.join(config_folder, config["demonstrations_folder"])
+
+    dataset_states_to_obs_multiprocessing(args, config)
