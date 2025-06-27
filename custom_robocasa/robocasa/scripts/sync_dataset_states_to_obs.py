@@ -36,6 +36,9 @@ from robocasa.utils.transform_utils import (
 )
 import robocasa.utils.robomimic.robomimic_torch_utils as TorchUtils
 
+
+PNG_COMPRESSION = 3  # default compression level for PNG images
+
 # from robomimic.utils.log_utils import log_warning
 
 def get_leaf_memory_usage(d, path=()):
@@ -493,7 +496,7 @@ def write_sample_to_folders(sample: Dict, output_folder: str, index: int, config
 
             rgb = np.asarray(sample["obs"][key])
             rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-            rgb_file = os.path.join(subfolder, f"{index:04d}.png")
+            rgb_file = os.path.join(subfolder, f"{index:04d}.jpeg")
             cv2.imwrite(rgb_file, rgb)
 
 
@@ -505,7 +508,7 @@ def write_sample_to_folders(sample: Dict, output_folder: str, index: int, config
             depth = (depth * 1000.0).astype(np.uint16)
 
             depth_file = os.path.join(subfolder, f"{index:04d}.png")
-            cv2.imwrite(depth_file, depth)
+            cv2.imwrite(depth_file, depth, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
 
         if "segmentation" in key:
             os.makedirs(subfolder, exist_ok=True)
@@ -514,8 +517,9 @@ def write_sample_to_folders(sample: Dict, output_folder: str, index: int, config
                 os.makedirs(subsubfolder, exist_ok=True)
 
                 seg = np.asarray(sample["obs"][key][subkey]) * 255
+                seg = seg.astype(np.uint8)
                 seg_file = os.path.join(subsubfolder, f"{index:04d}.png")
-                cv2.imwrite(seg_file, seg)
+                cv2.imwrite(seg_file, seg, [cv2.IMWRITE_PNG_COMPRESSION, PNG_COMPRESSION])
 
 
 
@@ -683,123 +687,6 @@ def dataset_states_to_obs_multiprocessing(args, config: Dict):
 
     print("Finished Multiprocessing")
     return
-
-def extract_robocasa(in_file: str, out_folder: str, config: dict):
-    in_hdf5 = h5py.File(in_file, "r")
-
-    # Create output folder if it doesn't exist
-    os.makedirs(out_folder, exist_ok=True)
-
-    in_obs = in_hdf5["obs"]
-
-    # Create empty config.json
-    config_file = os.path.join(out_folder, "config.json")
-    open(config_file, 'a').close()
-
-    intrinsics_keys = [key for key in in_obs.keys() if "intrinsics" in key or "extrinsics" in key]
-    cam_info_subfolder = os.path.join(out_folder, "cam_info")
-    os.makedirs(cam_info_subfolder, exist_ok=True)
-    for i in range(in_obs[intrinsics_keys[0]].shape[0]):
-        cam_info_dict = {key: in_obs[key][i].flatten().tolist() for key in intrinsics_keys}
-        out_file = os.path.join(cam_info_subfolder, f"{i:04d}.yaml")
-        with open(out_file, "w") as f:
-            yaml.dump(cam_info_dict, f)
-
-
-    # Extract camera intrinsics:
-    camera_intrinsics = {}
-    camera_extrinsics = {}
-    for key in in_obs.keys():
-        if "intrinsics" in key:
-            camera_intrinsics[key] = np.array(in_obs[key][0]).flatten().tolist()
-        if "extrinsics" in key:
-            camera_extrinsics[key] = np.array(in_obs[key][0]).flatten().tolist()
-
-    intrinsics_file = os.path.join(out_folder, "intrinsic.json")
-    with open(intrinsics_file, "w") as f:
-        json.dump(camera_intrinsics, f, indent=4)
-
-    extrinsics_file = os.path.join(out_folder, "extrinsic.json")
-    with open(extrinsics_file, "w") as f:
-        json.dump(camera_extrinsics, f, indent=4)
-
-    robot_base_pos = in_obs["robot0_base_pos"]
-    robot_base_quat = in_obs["robot0_base_quat"]
-    base_pos = in_obs["base_pos"]
-    base_rot = in_obs["base_rot"]
-    robot_base_pose = np.concatenate([robot_base_pos, robot_base_quat], axis=-1)
-    states_subfolder = os.path.join(out_folder, config["states_subfolder"])
-    os.makedirs(states_subfolder, exist_ok=True)
-    for i in range(robot_base_pose.shape[0]):
-        state_dict = {}
-        state_dict["robot_base_pose"] = robot_base_pose[i].flatten().tolist()
-        state_dict["robot_base_pos"] = robot_base_pos[i].flatten().tolist()
-        state_dict["robot_base_quat"] = robot_base_quat[i].flatten().tolist()
-        state_dict["base_pos"] = base_pos[i].flatten().tolist()
-        state_dict["base_rot"] = base_rot[i].flatten().tolist()
-        out_file = os.path.join(states_subfolder, f"{i:04d}.yaml")
-        with open(out_file, "w") as f:
-            yaml.dump(state_dict, f)
-
-    # Actions:
-    in_action_dict = in_hdf5["action_dict"]
-
-    subfolder = os.path.join(out_folder, config["action_subfolder"])
-    os.makedirs(subfolder, exist_ok=True)
-
-    action_len = in_action_dict[list(in_action_dict.keys())[0]].shape[0]
-    for i in range(action_len):
-        action_dict = {}
-        for key in in_action_dict.keys():
-            action_dict[key] = np.array(in_action_dict[key][i]).tolist()
-        out_file = os.path.join(subfolder, f"{i:04d}.yaml")
-        with open(out_file, "w") as f:
-            yaml.dump(action_dict, f)
-
-    # Extract images:
-    for key in tqdm.tqdm(in_obs.keys()):
-        if not "robot0_agentview" in key:
-            continue
-
-        subfolder = os.path.join(out_folder, key)
-
-        if "image" in key:
-            os.makedirs(subfolder, exist_ok=True)
-
-            images = np.asarray(in_obs[key])
-            for i in range(images.shape[0]):
-                rgb = images[i]
-                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-                rgb_file = os.path.join(subfolder, f"{i:04d}.png")
-                cv2.imwrite(rgb_file, rgb)
-
-
-        if "depth" in key:
-            os.makedirs(subfolder, exist_ok=True)
-
-            depths = np.asarray(in_obs[key])
-            for i in range(depths.shape[0]):
-                depth = depths[i]
-
-                depth = (depth * 1000.0).astype(np.uint16)
-
-                depth_file = os.path.join(subfolder, f"{i:04d}.png")
-                cv2.imwrite(depth_file, depth)
-
-        if "segmentation" in key:
-            os.makedirs(subfolder, exist_ok=True)
-            for subkey in in_obs[key].keys():
-                subsubfolder = os.path.join(subfolder, subkey)
-                os.makedirs(subsubfolder, exist_ok=True)
-
-                segmentations = np.asarray(in_obs[key][subkey])
-                for i in range(segmentations.shape[0]):
-                    seg = segmentations[i] * 255
-                    seg_file = os.path.join(subsubfolder, f"{i:04d}.png")
-                    cv2.imwrite(seg_file, seg)
-
-
-    pass
 
 
 if __name__ == "__main__":

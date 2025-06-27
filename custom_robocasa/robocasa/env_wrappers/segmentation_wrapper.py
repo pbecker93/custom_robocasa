@@ -102,6 +102,9 @@ class SegmentationWrapper(gym.Wrapper):
 
         self.segmentation_active = True
 
+        self.class_to_geom_ids = None
+
+
     def step(self, action):
         obs_dict, reward, done, info = self.env.step(action)
 
@@ -195,6 +198,7 @@ class SegmentationWrapper(gym.Wrapper):
 
             a_results = []
             a_stack = [self.env.sim.model.geom_bodyid[geom_id] for geom_id in geom_ids["door_obj"]]
+            a_stack = list(set(a_stack))  # Ensure unique body IDs
             door_geom_ids = []
             while len(a_stack) > 0:
                 a = a_stack.pop()
@@ -202,6 +206,7 @@ class SegmentationWrapper(gym.Wrapper):
                 door_geom_ids.extend(a_geom_ids)
 
                 a_stack.extend([geom_id for geom_id in range(self.env.sim.model.nbody) if self.env.sim.model.body_parentid[geom_id] == a])
+                a_stack = list(set(a_stack))
 
             door_geom_ids = list(set(door_geom_ids))
             geom_ids["door_obj"] = door_geom_ids
