@@ -17,6 +17,7 @@ ENV_CONFIG = {
     },
     "PnPSinkToCounter": {
         "classes": ["Counter", "Sink"],
+        "merged_classes": ["container_Sink"],    
         "include_obj": True
     },
     "PnPCounterToMicrowave": {
@@ -98,6 +99,7 @@ class SegmentationWrapper(gym.Wrapper):
         assert env_name in ENV_CONFIG, f"Environment {env_name} not supported"
 
         self.classes = ENV_CONFIG[env_name]["classes"] + ["PandaOmron", "PandaGripper"]
+        self.megerged_classes = ENV_CONFIG[env_name].get("merged_classes", [])
         self.include_obj = ENV_CONFIG[env_name]["include_obj"]
 
         self.segmentation_active = True
@@ -159,6 +161,10 @@ class SegmentationWrapper(gym.Wrapper):
 
                 masks[cam][class_name] = np.isin(segmentation, geom_ids_arr)
                 # masks[cam][class_name] = masks[cam][class_name].squeeze()
+
+            for class_name in self.megerged_classes:
+                mask1_name, mask2_name = class_name.split("_")
+                masks[cam][class_name] = np.maximum(masks[cam][mask1_name], masks[cam][mask2_name])
 
         return masks
 
